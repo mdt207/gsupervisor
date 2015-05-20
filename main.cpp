@@ -1,6 +1,6 @@
 /* C* Bismillahir Rahmanir Rahiym  C* */
 
-//Muqobil Dasturlar To'plami (c) hijriy 1436 (melodiy 2014)
+//Muqobil Dasturlar To'plami (c) hijriy 1436 (melodiy 2014-2015)
 
 #include <algorithm>
 #include <vector>
@@ -11,6 +11,7 @@
 #include <string>
 #include <ctime>
 #include <stdlib.h>
+#include <math.h>
 
 #include <gst/gst.h>
 #include <gtk/gtk.h>
@@ -22,15 +23,19 @@
 #define DEV_CONFIG 1
 #define WORD_SIZE 64
 
+#define abs(x) fabs(x)
+
 //consts
-const char ver[]      = { "0.01" };
+const char ver[]      = { "0.78" };
 const char prog_name[]= {"GTester"};
+
+using namespace std;
 
 sqlite3 *pDB, *pProdsBoughtDB;
 sqlite3_stmt *pStmt;
 
 std::string insert_next_navID = "insert into nav_watts values(:dateidx, $navID, $Watt)";
-std::string insert_next_mv = "insert into nav_mv values($navID, :timeID, $mv)";
+std::string insert_next_mv = "insert into nav_mv values($navID, :timeID, $mv, $Watt)";
 
 GstElement *pipeline, *source, *demuxer, *decoder, *conv, *sink;
 GstElement *playbin2;
@@ -49,10 +54,13 @@ GtkWidget *but_start_getval;
 
 unsigned char buf[9];
 gchar Watt[20];
+
 int i=0, c=0, len=9, actual, base[6];
-int timeOut=0, navID;
+int timeOut=0, navID, bResume;
+short _count_alrm = 0;
+
 std::string tmp, str2num, serr, gTimeStr, sumWatt;
-bool corr_order = false;
+bool corr_order = false, isSettingsNew = false, bTaskPause = false;
 
 GMutex data_mutex;
 GCond data_cond;
@@ -73,10 +81,28 @@ static void on_pad_added (GstElement *element, GstPad *pad, gpointer data);
 
 int hid_send_feature_report(libusb_device_handle *hdev, const unsigned char *data, size_t length);
 
-using namespace std;
-
 void corr_order_foo (gpointer data);
 bool isorder_foo(void);
+
+bool copyf(std::istream &ifs, std::ostream &ofs)
+{
+    ofs << ifs.rdbuf();
+    return true;
+}
+
+void backup_db()
+{
+  std::string name_fl = "navbat_id";
+  std::ifstream inp(name_fl.c_str(), std::ios_base::in | std::ios_base::binary);
+  std::ofstream outp;//("navbat_id.bak");
+
+  name_fl.append(gTimeStr+".bak");
+  outp.open(&name_fl[0], std::ios_base::out | std::ios_base::binary );
+  copyf(inp, outp);
+
+  inp.close();
+  outp.close();
+}
 
 double median(vector<double> &amv, int n)
 {
@@ -101,13 +127,15 @@ static gpointer thread_func2(gpointer data)
     char buf_tm[20];
     struct tm *_pTime;
 
+    string del_sql = "delete from nav_mv where navID = $navID";
+
     while(gStarted)
     {
         //cout << timeOut;
         //isorder_foo();
-        Sleep(1000);
+        sleep(1000);
         //cout << str2num << endl;
-        if(isorder_foo())
+        if(isorder_foo() && !bTaskPause)
             {
                 timeOut++;
                 //c = 0;
@@ -119,7 +147,7 @@ static gpointer thread_func2(gpointer data)
         {
             //struct tm *info;
             sort(amv_per_sec.begin(), amv_per_sec.end());
-            dret = median(amv_per_sec, amv_per_sec.size());
+            dret = abs(median(amv_per_sec, amv_per_sec.size()));
 
             time( &rawtime );
             _pTime = localtime( &rawtime );
@@ -128,15 +156,20 @@ static gpointer thread_func2(gpointer data)
 
             timeOut = 0;
             //cout << timeOut << endl;
-            if(fres > 0.2 || fres < (-5.0) ){
-            amv_median[++r] = dret;
-            //kW += (dret*16.666/0.26);
-            kW += (dret*multNum);//64.1);
+            //if( abs(fres) >= 0.4) //|| fres < (-5.0) )
+            if( dret >= 0.4)
+            {
+                amv_median[++r] = dret;
+                //kW += (dret*16.666/0.26);
+                kW += (dret*multNum);//64.1);
             }
             else{
-                _timeout++;
-                if(_timeout % 180 == 0)
-                    _timeout = kW = 0;
+                //_timeout++;
+                //if((_timeout != 0) && (_timeout % 180 == 0))
+                    {
+                        //_timeout = 0;
+                        kW +=0;
+                    }
             }
             g_ascii_dtostr(Watt, 9, kW);
             //copy(amv_per_sec.begin(), amv_per_sec.end(), ofile);
@@ -153,11 +186,38 @@ static gpointer thread_func2(gpointer data)
                         strftime(buf_tm, sizeof(buf_tm), "%Y%m%d", pTime);
                         gTimeStr.assign(buf_tm);
 
+                        //back up the DB for removing useless dates for next month
+                        if( _pTime->tm_mday == 1 )//|| pTime->tm_mday == 29 || pTime->tm_mday == 30 || pTime->tm_mday == 31)
+                            {
+
+                                backup_db();
+
+                                ret = sqlite3_prepare_v2(pDB, &del_sql[0], -1, &pStmt, 0);
+
+                                for( unsigned short count_day=1; count_day < 32; count_day++)
+                                    {
+                                        if(ret == SQLITE_OK)
+                                        {
+                                            ret = sqlite3_bind_int (pStmt, 1, count_day);
+
+                                            if(ret == SQLITE_OK)
+                                            {
+                                                ret = sqlite3_step(pStmt);
+                                                if(ret == SQLITE_DONE)
+                                                        ret = sqlite3_reset(pStmt);
+                                            }
+                                        }
+                                    }
+                            }
+
                         ret = sqlite3_prepare_v2(pDB, &insert_next_navID[0], -1, &pStmt, 0);
                         //kW = median(awatt_per_hour, awatt_per_hour.size());
 
                         if(ret == SQLITE_OK)
                             {
+                                //string msg_info = "insert SQL statement has error...";
+                                //MessageBox(msg_info);
+                                //return;
                                 ret = sqlite3_bind_text(pStmt, 1, &gTimeStr[0], -1,  NULL);
                                 ret = sqlite3_bind_int (pStmt, 2, navID);
                                 ret = sqlite3_bind_double(pStmt, 3, kW);
@@ -177,7 +237,7 @@ static gpointer thread_func2(gpointer data)
                             //back to the...
                             kW=0;
                             navID = _pTime->tm_mday;
-                            *pTime = *_pTime;
+                            *pTime = *_pTime;  //pass the date(yyyy.mm.dd HH.MM) of the new today
                             //awatt_per_hour.clear();
                             strftime(buf_tm, sizeof(buf_tm),"%H%M", _pTime);
                             gTimeStr.assign(buf_tm);
@@ -192,7 +252,7 @@ static gpointer thread_func2(gpointer data)
                 //kW += dret/0.26;
                 //awatt_per_hour.push_back(dret/0.26);
                 //g_ascii_dtostr((gchar*)Watt, 10, kW);
-                cout << "1h mV median: "<< dret <<" "<< dret/0.26 << endl;
+                //cout << "1h mV median: "<< dret <<" "<< dret/0.26 << endl;
 
                 ret = sqlite3_prepare_v2(pDB, &insert_next_mv[0], -1, &pStmt, 0);
 
@@ -201,6 +261,7 @@ static gpointer thread_func2(gpointer data)
                         ret = sqlite3_bind_int (pStmt, 1, navID);
                         ret = sqlite3_bind_text(pStmt, 2, &gTimeStr[0], -1,  NULL);
                         ret = sqlite3_bind_double(pStmt, 3, dret);
+                        ret = sqlite3_bind_double(pStmt, 4, kW);
 
                         ret = sqlite3_step(pStmt);
 
@@ -209,6 +270,7 @@ static gpointer thread_func2(gpointer data)
                                     string msg_info = "SQL command evaluation not done...";
                                     cout << msg_info << endl;
                                 }
+
                         //cout << gTimeStr << endl;
                     }
             }
@@ -249,6 +311,14 @@ thread_func( gpointer data )
                         //ss << tmp;//[i];
                     }
                     ss >> str2num;
+                    //ss.clear();
+                    //str2num.assign( tmp);
+                    //base[2] = strtoul((char*)&tmp[5], reinterpret_cast<char**>(&tmp[6]), 10);
+                    //ss << tmp[5]; ss >> target;
+
+                    //str2num.clear();
+                    //str2num = "000013231";
+                    //if(len > 5)
                         {
                             base[2] = std::stod(string(1,str2num[5]), nullptr); //dot position in
                             base[3] = std::stod(string(1,str2num[6]), nullptr); //DC or AC
@@ -286,21 +356,40 @@ thread_func( gpointer data )
                         }
 
                     fres = atof((char*)&str2num[0]);
+                    //fres = strtof((char*)&str2num[0], NULL);
+                    //g_snprintf((gchar*)buf, sizeof(buf), "%.4f", fres);
+                    //fres = atof((gchar*)buf);
 
+                    //cout << str2num << " " << fres << endl;
+                    //for(i=0; i< 179999; i++);
+
+                    //gtk_text_buffer_insert_with_tags_by_name(buffer, &txt_iter, &str2num[0], -1, "big", "blue_foreground" ,"wide_margins", NULL);
+                    //tmp.clear();
                     ss.clear();
                 }
 
+                //cout << actual << endl;
+                //actual = 0; i = 0;
+                //while( actual == 0)
                     {
 
                     //r = libusb_interrupt_transfer(hdev, 0x82, (unsigned char*)buf, sizeof(buf), &actual, 5000);
-                    libusb_interrupt_transfer(hdev, 0x82, (unsigned char*)buf, sizeof(buf), &actual, 1000);
+                    libusb_interrupt_transfer(hdev, 0x82, (unsigned char*)buf, sizeof(buf), &actual, 5000);
                     //actual = 1; i=1;
                     buf[1] &= 0x7F;
+
+                    /*if( isdigit(buf[1] ) != 0)
+                    {
+                        //base[1] = atoi((char*)&buf[1]);
+                        ++i;
+                    }*/
 
                     if( isdigit(buf[1]) !=0  && c <= len && actual != 0)
                     {
                         //cout << actual << " " << sizeof(buf) << endl;
                         c++;
+                        //tmp.append((char*)&buf[1]);
+                        //tmp.push_back(buf[1]);
                         ss << buf[1];
                     }
                 }
@@ -332,12 +421,30 @@ isorder_foo (void)
   return data;
 }
 
+gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data)
+{
+    if(event->keyval == GDK_KEY_space) { bTaskPause = !bTaskPause; return FALSE;};
+    return FALSE;
+}
+
 static gboolean
 cb_timeout( gpointer data )
 {
     GtkTextBuffer *buffer = GTK_TEXT_BUFFER(data);
     GtkTextIter txt_iter;
     gchar *label = NULL;
+    //static short _count_alrm = 0;
+
+    //G_LOCK( corr_order );
+
+    //label = g_strdup_printf( "%s", &str2num[0] );
+    //G_UNLOCK( corr_order );
+
+    //gtk_button_set_label( GTK_BUTTON( data ), label );
+
+    //buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (view));
+
+    //buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (view));
 
     if(gStarted){
         //cout << str2num.length() << endl;
@@ -352,19 +459,106 @@ cb_timeout( gpointer data )
                 g_mutex_unlock (&data_mutex);
 
                 c = 0;
+                //corr_order = false;
+                //timeOut++;
 
-                if ( fres < gLow ||  fres > gUp )
-                     if(!sound_off) gst_element_set_state (GST_ELEMENT(playbin2), GST_STATE_PLAYING);
+                if ( ( abs(fres) < gLow ||  abs(fres) > gUp ) && (!bTaskPause) ){
+                    ++_count_alrm;
+                     if ((!sound_off) && (_count_alrm > 3) && abs(fres) > 0.15)
+                        {
+                            gsStateChRet = gst_element_set_state (GST_ELEMENT(playbin2), GST_STATE_PLAYING);
+                            //if(gsStateChRet == GST_MESSAGE_EOS) _count_alrm = 0;
+                        }
                     else gst_element_set_state (GST_ELEMENT(playbin2), GST_STATE_READY);
+                }
+
+                //if( timeOut%60 == 0)
+                {
+                //struct tm *info;
+                /*char buf[20];
+
+                time( &rawtime );
+
+                pTime = localtime( &rawtime );
+
+                strftime(buf,WORD_SIZE,"%H%M", pTime);
+                gTimeStr.assign(buf);
+
+                if (gTimeStr.compare("0800") == 0)
+                    {
+                        ++navID;
+                        strftime(buf,WORD_SIZE,"%Y%m%d", pTime);
+                        gTimeStr.assign(buf);
+
+                        int ret = sqlite3_prepare_v2(pDB, &insert_next_navID[0], -1, &pStmt, 0);
+                        int kW = 0;
+
+                        if(ret == SQLITE_OK)
+                            {
+                                //string msg_info = "insert SQL statement has error...";
+                                //MessageBox(msg_info);
+                                //return;
+                                ret = sqlite3_bind_text(pStmt, 1, &gTimeStr[0], -1,  NULL);
+                                ret = sqlite3_bind_int (pStmt, 2, navID);
+                                ret = sqlite3_bind_int (pStmt, 3, kW);
+
+                                if( ret != SQLITE_OK) cout << "Error in bind" <<endl;
+
+                                ret = sqlite3_step(pStmt);
+
+                                if(ret != SQLITE_DONE)
+                                {
+                                    string msg_info = "SQL command evaluation not done...";
+                                    cout << msg_info << endl;
+                                    //MessageBox(msg_info);
+                                    //return;
+                                }
+                            }
+                            //back to the...
+                            strftime(buf,WORD_SIZE,"%H%M", pTime);
+                            gTimeStr.assign(buf);
+
+                    }//Watts and next navID
+
+
+                    //int ret = sqlite3_prepare_v2(pDB, &insert_next_mv[0], -1, &pStmt, 0);
+
+                    if(ret == SQLITE_OK){
+
+                        /*ret = sqlite3_bind_int (pStmt, 1, navID);
+                        ret = sqlite3_bind_text(pStmt, 2, &gTimeStr[0], -1,  NULL);
+                        ret = sqlite3_bind_double(pStmt, 3, fres);
+
+                        ret = sqlite3_step(pStmt);
+
+                        if(ret != SQLITE_DONE)
+                                {
+                                    string msg_info = "SQL command evaluation not done...";
+                                    cout << msg_info << endl;
+                                }/
+
+                        cout << gTimeStr << endl;
+                    }*/
+
+                    //timeOut = 0;
+                }
+
             }
+        /*if(base[3] == 3) serr = "DC mV";
+        else
+        if(base[3] == 1 && base[4] == 0){
+                serr = "DC";
+                /*if (base[5] == 5 || base[5] == 6)
+                    str2num.insert(0 , "-");/
+        }*/
+        //g_strlcat((gchar*)&str2num[0], "\n", -1);
 
-
-        str2num.append("\n");
+        //str2num.append("\n");
         gtk_text_buffer_insert_with_tags_by_name(buffer, &txt_iter, &str2num[0], -1, "big", "blue_foreground", NULL);
 
         gtk_text_buffer_get_end_iter(buffer, &txt_iter);
 
-        tmp = "Watts: ";
+        tmp = "\nWatts: ";
         tmp.append(Watt);
         gtk_text_buffer_insert_with_tags_by_name(buffer, &txt_iter, &tmp[0], -1, "right_justify", "little_big", NULL);
         //if(kW == 0)
@@ -379,6 +573,8 @@ cb_timeout( gpointer data )
 
         gtk_text_buffer_get_iter_at_offset (buffer, &txt_iter, 0);
         //gtk_text_buffer_get_iter_at_line(buffer, &txt_iter, 0);
+        bTaskPause ?
+        gtk_text_buffer_insert_with_tags_by_name(buffer, &txt_iter, "Process Paused!\n", -1, "right_justify", NULL) :
         gtk_text_buffer_insert_with_tags_by_name(buffer, &txt_iter, "Process Started!\n", -1, "right_justify", NULL);
 
         gtk_text_buffer_get_end_iter(buffer, &txt_iter);
@@ -391,19 +587,35 @@ cb_timeout( gpointer data )
     return( TRUE );
 }
 
-static void correct_usb_accetp(GtkWidget *win, gpointer data)
+static void correct_usb_accept(GtkWidget *win, gpointer data)
 {
-
+    //G_LOCK( tmp );
+    //tmp.clear();
+    //G_UNLOCK( tmp );
     c=0;
     gst_element_set_state (playbin2, GST_STATE_READY);
     //gst_element_abort_state(GST_ELEMENT(pipeline));
 }
 
 GThread *thread2 = NULL;
-static void start_usb_accetp(GtkWidget *win, gpointer data)
+static void start_usb_accept(GtkWidget *win, gpointer data)
 {
     GtkTextBuffer *buffer = NULL;
     GtkTextIter txt_iter;
+    //unsigned char buf[64];
+    //int i, c, len, actual, base[6];
+
+    //stringstream ss;
+    //string str2num, tmp;
+
+    //std::string str = "Process STARTED!!!\n";
+
+    /*buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (view));
+    gtk_text_buffer_set_text (buffer, "", 0);
+    gtk_text_buffer_get_iter_at_offset (buffer, &txt_iter, 0);
+    gtk_text_buffer_insert_with_tags_by_name(buffer, &txt_iter, &str[0], -1, "right_justify", "blue_foreground" ,"wide_margins", NULL);*/
+
+
 
     GThread *_thread = (GThread*)(data);
     GError *error, *error2;
@@ -433,9 +645,49 @@ static void start_usb_accetp(GtkWidget *win, gpointer data)
             amv_per_sec.resize(60);
             amv_median.resize(10);
         }
-}
 
-static void levels_accetp(GtkWidget *wid, GtkWidget *win)
+    //while(  actual >= 0 )
+        /*{
+            if(c  >= len)
+            {
+                c = 0;
+                 ss.clear();
+                for(i=0; i <= 10; i++)
+                    {
+                        //ss << got_nums[i];
+                        ss << tmp[i];
+                    }
+                ss >> str2num;
+                base[2] = strtoul((char*)&tmp[5], reinterpret_cast<char**>(&tmp[6]), 10);
+
+                //str2num.insert(base[2], ".");
+                //fres = strtof((char*)&str2num[0], NULL);
+                gtk_text_buffer_insert_with_tags_by_name(buffer, &txt_iter, &str2num[0], -1, "big", "blue_foreground" ,"wide_margins", NULL);
+                tmp.clear();
+            }
+
+            actual = 0;
+            //while ( actual  == 0 )
+            {
+                r = libusb_interrupt_transfer(hdev, 0x82, (unsigned char*)buf, sizeof(buf), &actual, 5000);
+                buf[1] &= 0x7F;
+
+                if( isdigit(buf[1] ) != 0)
+                {
+                   base[1] = atoi((char*)&buf[1]);
+                    ++i;
+                }
+
+                if(i>0  && c <= len && actual != 0)
+                {
+                    ++c;
+                    tmp.append((char*)&buf[1]);
+                }
+            }
+        }*/
+
+}
+static void levels_accept(GtkWidget *wid, GtkWidget *win)
 {
   GtkWidget *content_area;
   GtkWidget *dialog;
@@ -489,29 +741,34 @@ static void levels_accetp(GtkWidget *wid, GtkWidget *win)
 
   if (response == GTK_RESPONSE_OK)
     {
+       std::basic_string <char>::size_type pos;
+
+       isSettingsNew = true;
       //string _tmp;
       //gtk_entry_set_text (GTK_ENTRY (entry1), gtk_entry_get_text (GTK_ENTRY (local_entry1)));
       //gtk_entry_set_text (GTK_ENTRY (entry2), gtk_entry_get_text (GTK_ENTRY (local_entry2)));
       tmp = static_cast<string>(gtk_entry_get_text (GTK_ENTRY (local_entry1)));
 
-    if(gStarted){
+    /*if(gStarted){
         if(base[3] == 3)
             str2num.insert(3,",");
         else
             tmp.insert(base[2], ",");
-        }
-
+        }*/
+      //pos = tmp.find(".");
+      //pos != std::basic_string <char>::npos ? tmp.replace(pos,1, ",") : tmp;
       gUp =  std::stof(tmp, nullptr);
       //gLow = strtof(gtk_entry_get_text (GTK_ENTRY (local_entry2)), nullptr);
       tmp = static_cast<string>(gtk_entry_get_text(GTK_ENTRY(local_entry2)));
 
-    if(gStarted){
+    /*if(gStarted){
         if(base[3] == 3)
             str2num.insert(3,",");
         else
             tmp.insert(base[2], ",");
-        }
-
+        }*/
+      //pos = tmp.find(".");
+      //pos != std::basic_string <char>::npos ? tmp.replace(pos,1, ",") : tmp;
       gLow = std::stof(tmp, nullptr);
       cout << gUp << gLow /*<< " " << std::stof("0,0001105", nullptr)*/ <<endl;
     }
@@ -526,13 +783,25 @@ static void helloWorld (GtkWidget *wid, GtkWidget *win)
   GtkTextBuffer *buffer = NULL;
   GtkTextIter txt_iter;
   bool bset_sensitive  = true;
-  std::string str = "This just a testing TEXT!!!";
+  std::string str;// = "This just a testing TEXT!!!";
 
   buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (view));
   gtk_text_buffer_set_text (buffer, "", 0);
   gtk_text_buffer_get_iter_at_offset (buffer, &txt_iter, 0);
 
-  if(!sound_off) gst_element_set_state (GST_ELEMENT(playbin2), GST_STATE_PLAYING);
+  //g_signal_connect (demuxer, "pad-added", G_CALLBACK (on_pad_added), decoder);
+  //gst_element_set_state (pipeline, GST_STATE_PAUSED);
+  //gst_element_change_state(pipeline, GST_STATE_CHANGE_PLAYING_TO_PAUSED);
+  //gst_element_change_state(pipeline, GST_STATE_CHANGE_PAUSED_TO_PLAYING);
+  //if(!sound_off) gst_element_set_state (GST_ELEMENT(playbin2), GST_STATE_PLAYING);
+
+  /*GstPad *sinkpad, *pad;
+  pad = gst_element_get_static_pad (demuxer, "src");
+  sinkpad = gst_element_get_static_pad (decoder, "sink");
+  gst_pad_unlink (pad, sinkpad);
+  gst_object_unref (sinkpad);
+  gst_object_unref (pad);*/
+
 
   hdev = libusb_open_device_with_vid_pid(ctx, 0x1a86, 0xe008);
 
@@ -540,6 +809,9 @@ static void helloWorld (GtkWidget *wid, GtkWidget *win)
             {
                 bset_sensitive  = false;
                 str = "Failed to connect \n c ya...";
+                //libusb_close(hdev);
+                //libusb_exit(ctx); //close the session
+                //goto fin;
                 gtk_text_buffer_insert_with_tags_by_name(buffer, &txt_iter, &str[0], -1, "little_big", "blue_foreground" , NULL);
                 return;
             }
@@ -592,6 +864,13 @@ static void helloWorld (GtkWidget *wid, GtkWidget *win)
 
     gtk_widget_set_sensitive(but_start_getval, bset_sensitive);
 
+
+  //start_usb_accetp(NULL, NULL);
+
+  /*dialog = gtk_message_dialog_new (GTK_WINDOW (win), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE, "Hello World!");
+  gtk_window_set_position (GTK_WINDOW (dialog), GTK_WIN_POS_CENTER);
+  gtk_dialog_run (GTK_DIALOG (dialog));
+  gtk_widget_destroy (dialog);*/
 }
 static void
 toggle_snd_off(GtkToggleButton *check_button, gpointer data)
@@ -636,9 +915,12 @@ bus_call (GstBus *bus, GstMessage *msg, gpointer data)
     GMainLoop *loop = (GMainLoop *) data;
     switch (GST_MESSAGE_TYPE (msg)) {
     case GST_MESSAGE_EOS:
+        {
         //g_print ("End of stream\n");
         //g_main_loop_quit (loop);
+        _count_alrm = 0;
         gst_element_set_state (playbin2, GST_STATE_READY);
+        }
         break;
         case GST_MESSAGE_ERROR: {
             gchar *debug;
@@ -658,35 +940,79 @@ return TRUE;
 
 int InitDB()
 {
-  int ret, nRows;
+  int ret, TimeStr;
   char buf_tm[20];
+  /*string TimeStr;
+  TimeStr.resize(10);*/
 
   ifstream ifpar;
 
    ifpar.open("params.dat", ios::in);
+
+  time( &rawtime );
+  pTime = localtime( &rawtime );
+  strftime(buf_tm, sizeof(buf_tm),"%Y%m%d", pTime);
+
    if(ifpar.is_open())
-    ifpar >> multNum >> gUp >> gLow;
-   else
-    multNum = 64.1;
+   {
+        ifpar >> multNum >> gUp >> gLow;
+
+        /*ifpar.getline(&TimeStr[0], WORD_SIZE);
+        ifpar.getline( &TimeStr[0], WORD_SIZE );*/
+        ifpar >> TimeStr >> kW;
+
+        //TimeStr.compare(buf_tm) != 0 ? cout << TimeStr << endl: cout << "Failed" << endl;
+        TimeStr == std::stod(buf_tm, nullptr) ? kW : kW=0;
+        printf("%.4f\n", kW);
+        multNum = 16.666 / multNum;
+    }
+   /*else
+    multNum = 64.1;*/
+  ifpar.close();
 
   ret = sqlite3_open_v2("navbat_id", &pDB, SQLITE_OPEN_READWRITE, NULL);
   ret == SQLITE_OK ? cout << "DB connected OK!" <<endl : cout << "Failure..." <<endl;
 
-  time( &rawtime );
-  pTime = localtime( &rawtime );
-  //strftime(buf_tm, sizeof(buf_tm),"%d", pTime);
+  //string SQLst = "select count(*) from nav_watts";
+
+  //ret = sqlite3_prepare_v2(pDB, &SQLst[0], SQLst.length() , &pStmt, NULL);
+  //sqlite3_step(pStmt);
+
+  //navID = sqlite3_column_int(pStmt, 0);
+  //navID == 0 ? navID = 1 : navID = navID;
+
+
   navID = pTime->tm_mday;
 
   cout << navID <<endl;
+  return ret;
 }
 
 int FinalizeDB()
 {
+  ofstream ofpar;
+
+  if(isSettingsNew){
+   ofpar.open("params.dat", ios::out);
+
+    if(!ofpar.fail())
+        {
+            char buf_tm[20];
+            strftime(buf_tm, sizeof(buf_tm),"%Y%m%d", pTime);
+
+            ofpar << 16.666/multNum << " " << gUp << " " << gLow << endl;
+            ofpar << (int)strtol (buf_tm, (char**)NULL, 10) << " "<< kW << endl;
+        }
+    ofpar.close();
+  }
+
   int ret = sqlite3_finalize(pStmt);
   ret == SQLITE_OK ? cout << "statement finalized" <<endl : cout << "Failed..." <<endl;
 
   ret = sqlite3_close_v2(pDB);
   ret == SQLITE_OK ? cout << "DB closed" <<endl : cout << "Closing Failed..." <<endl;
+
+  return ret;
 }
 
 void about_us( GtkWidget *widget,
@@ -722,6 +1048,21 @@ int main (int argc, char *argv[])
 
 
   /* Create gstreamer elements */
+/*    pipeline = gst_pipeline_new ("audio-player");
+    source = gst_element_factory_make ("filesrc", "file-source");
+    demuxer = gst_element_factory_make ("oggdemux", "ogg-demuxer");
+    //demuxer = gst_element_factory_make ("oggdemux", "demuxer");
+    decoder = gst_element_factory_make ("vorbisdec", "vorbis-decoder");
+    conv = gst_element_factory_make ("audioconvert", "converter");
+    sink = gst_element_factory_make ("autoaudiosink", "audio-output");
+
+    if (!pipeline || !source || !demuxer || !decoder || !conv || !sink) {
+        g_printerr ("One element could not be created. Exiting.\n");
+        return -1;
+    }*/
+
+    //pipeline = gst_parse_launch ("playbin uri=file://C:/gstreamer/1.0/x86/bin/test.ogg", NULL);
+
     playbin2 = gst_element_factory_make ("playbin", "playbin2");
     if( !playbin2){
         g_printerr("Not all elements could be made. \n");
@@ -731,7 +1072,7 @@ int main (int argc, char *argv[])
     /* Set up the pipeline */
     /* we set the input filename to the source element */
     //g_object_set (G_OBJECT (source), "location", "test.ogg", NULL);
-    g_object_set (G_OBJECT (playbin2), "uri", "file:///C:/test.ogg", NULL);
+    g_object_set (G_OBJECT (playbin2), "uri", "file:///home/mdt/test.ogg", NULL);
 
     /* we add a message handler */
     //bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
@@ -767,6 +1108,8 @@ int main (int argc, char *argv[])
   gtk_window_set_position (GTK_WINDOW (win), GTK_WIN_POS_CENTER);
   gtk_widget_realize (win);
   g_signal_connect (win, "destroy", gtk_main_quit, NULL);
+  g_signal_connect (G_OBJECT (win), "key_press_event", G_CALLBACK (on_key_press), NULL);
+
 
   if( InitDB() < 0 ) return 0;
 
@@ -831,7 +1174,7 @@ int main (int argc, char *argv[])
   //gtk_box_pack_start(GTK_BOX (hbox), view, TRUE, TRUE, 6);
 
   gtk_window_set_default_size (GTK_WINDOW (win), 530, 290);
-  gdk_threads_add_timeout( 1000, cb_timeout, (gpointer)buffer );
+  gdk_threads_add_timeout( 500, cb_timeout, (gpointer)buffer );
 
 /* Create a vertical box with buttons */
   frame_vert = gtk_frame_new ("Controls:");
@@ -848,15 +1191,15 @@ int main (int argc, char *argv[])
 
   but_start_getval = gtk_button_new_from_stock (GTK_STOCK_GO_FORWARD);
   gtk_widget_set_sensitive(but_start_getval, FALSE);
-  g_signal_connect (G_OBJECT (but_start_getval), "clicked", G_CALLBACK (start_usb_accetp), (gpointer) thread );
+  g_signal_connect (G_OBJECT (but_start_getval), "clicked", G_CALLBACK (start_usb_accept), (gpointer) thread );
   gtk_box_pack_start (GTK_BOX (vbox), but_start_getval, TRUE, TRUE, 0);
 
   button = gtk_button_new_from_stock (GTK_STOCK_REFRESH);
-  g_signal_connect (G_OBJECT (button), "clicked", G_CALLBACK (correct_usb_accetp), NULL );
+  g_signal_connect (G_OBJECT (button), "clicked", G_CALLBACK (correct_usb_accept), NULL );
   gtk_box_pack_start (GTK_BOX (vbox), button, TRUE, TRUE, 0);
 
   button = gtk_button_new_with_mnemonic("Leve_ls");
-  g_signal_connect (G_OBJECT (button), "clicked", G_CALLBACK (levels_accetp), NULL );
+  g_signal_connect (G_OBJECT (button), "clicked", G_CALLBACK (levels_accept), NULL );
   gtk_box_pack_start (GTK_BOX (vbox), button, TRUE, TRUE, 0);
 
   button = gtk_button_new_with_mnemonic("Abou_t");
@@ -872,9 +1215,38 @@ int main (int argc, char *argv[])
   g_signal_connect (radio1, "toggled",  G_CALLBACK (toggle_snd_off), NULL);
   gtk_box_pack_start(GTK_BOX (vbox), radio1, TRUE, TRUE, 0);
 
+   /*string _case1, _case2, _case3 ;
+  /* Create a radio button /
+   radio1 = gtk_radio_button_new_with_label_from_widget (NULL, "AC");
+
+   _case1 = "1";
+   g_signal_connect (radio1, "toggled",  G_CALLBACK (toggle_admin), (gpointer)&_case1[0]);
+   /*entry = gtk_entry_new ();
+   gtk_container_add (GTK_CONTAINER (radio1), entry);/
+
+
+   /* Create a radio button with a label /
+   radio2 = gtk_radio_button_new_with_label_from_widget (GTK_RADIO_BUTTON (radio1),
+                                                         "DC");
+   _case2 = "2";
+   g_signal_connect (radio2, "toggled",  G_CALLBACK (toggle_admin), (gpointer)&_case2[0]);
+
+   radio3 = gtk_radio_button_new_with_label_from_widget (GTK_RADIO_BUTTON (radio2),
+                                                         "mV");
+    _case3 = "3";
+   g_signal_connect (radio3, "toggled",  G_CALLBACK (toggle_admin), (gpointer)&_case3[0]);
+
+    gtk_box_pack_start (GTK_BOX (vbox), radio1, TRUE, TRUE, 2);
+    gtk_box_pack_start (GTK_BOX (vbox), radio2, TRUE, TRUE, 2);
+    gtk_box_pack_start (GTK_BOX (vbox), radio3, TRUE, TRUE, 2);*/
+
+
   /* Enter the main loop */
   gtk_widget_show_all (win);
   gtk_main ();
+
+  //gst_element_set_state (pipeline, GST_STATE_NULL);
+  //gst_object_unref (GST_OBJECT (pipeline));
 
   FinalizeDB();
 
