@@ -1,4 +1,4 @@
-# guitester
+# gsupervisor
 Developed for UNI-T 71D Digital Multimeter.
 Still under development.
 Needs following:
